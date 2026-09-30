@@ -41,6 +41,33 @@ mod imp {
     use windows::core::PCWSTR;
 
     const MAX_DRIVES: u32 = 32;
+    const IOCTL_ATA_PASS_THROUGH: u32 = 0x0004D02C;
+    const ATA_FLAGS_DRDY_REQUIRED: u16 = 0x01;
+    const ATA_FLAGS_DATA_IN: u16 = 0x02;
+    const ATA_CMD_IDENTIFY_DEVICE: u8 = 0xEC;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct AtaPassThroughEx {
+        Length: u16,
+        AtaFlags: u16,
+        PathId: u8,
+        TargetId: u8,
+        Lun: u8,
+        ReservedAsUchar: u8,
+        DataTransferLength: u32,
+        TimeOutValue: u32,
+        ReservedAsUlong: u32,
+        DataBufferOffset: usize,
+        PreviousTaskFile: [u8; 8],
+        CurrentTaskFile: [u8; 8],
+    }
+
+    #[repr(C)]
+    struct AtaIdentifyBuffer {
+        header: AtaPassThroughEx,
+        data: [u8; 512],
+    }
 
     /// Bus type values from STORAGE_BUS_TYPE enum.
     const BUS_TYPE_ATA: u32 = 0x3;
@@ -135,6 +162,111 @@ mod imp {
         }
     }
 
+    fn query_ata_security(path: &Path) -> Option<AtaSecurityState> {
+        let path_str = path.to_string_lossy();
+        let wide = to_wide_null(&path_str);
+
+        // ATA pass-through on Windows requires a handle opened with
+        // GENERIC_READ | GENERIC_WRITE even though IDENTIFY DEVICE itself
+        // is a read-only ATA command.
+        let handle = match unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                (0x80000000u32 | 0x40000000u32).into(), // GENERIC_READ | GENERIC_WRITE
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                Default::default(),
+                None,
+            )
+        } {
+            Ok(h) if h != INVALID_HANDLE_VALUE => h,
+            Ok(_) => return None,
+            Err(e) => {
+                log::debug!("ATA IDENTIFY could not open {}: {}", path.display(), e);
+                return None;
+            }
+        };
+
+        let result = (|| -> Option<AtaSecurityState> {
+            let mut buf: AtaIdentifyBuffer = unsafe { mem::zeroed() };
+
+            buf.header.Length = mem::size_of::<AtaPassThroughEx>() as u16;
+            buf.header.AtaFlags = ATA_FLAGS_DATA_IN | ATA_FLAGS_DRDY_REQUIRED;
+            buf.header.DataTransferLength = 512;
+            buf.header.TimeOutValue = 10;
+            buf.header.DataBufferOffset = mem::offset_of!(AtaIdentifyBuffer, data);
+
+            // CurrentTaskFile:
+            // [Features, SectorCount, SectorNumber, CylLow,
+            //  CylHigh, DevHead, Command, Reserved]
+            buf.header.CurrentTaskFile[6] = ATA_CMD_IDENTIFY_DEVICE;
+
+            let mut bytes_returned: u32 = 0;
+            let buf_size = mem::size_of::<AtaIdentifyBuffer>() as u32;
+
+            let ioctl_result = unsafe {
+                DeviceIoControl(
+                    handle,
+                    IOCTL_ATA_PASS_THROUGH,
+                    Some(&buf as *const _ as *const _),
+                    buf_size,
+                    Some(&mut buf as *mut _ as *mut _),
+                    buf_size,
+                    Some(&mut bytes_returned),
+                    None,
+                )
+            };
+
+            if let Err(e) = ioctl_result {
+                log::debug!("ATA IDENTIFY failed for {}: {}", path.display(), e);
+                return None;
+            }
+
+            // ATA IDENTIFY word 128 = Security Status.
+            let offset = 128 * 2;
+            let word128 = u16::from_le_bytes([buf.data[offset], buf.data[offset + 1]]);
+
+            let supported = word128 & (1 << 0) != 0;
+            let enabled = word128 & (1 << 1) != 0;
+            let locked = word128 & (1 << 2) != 0;
+            let frozen = word128 & (1 << 3) != 0;
+            let count_expired = word128 & (1 << 4) != 0;
+
+            log::debug!(
+                "ATA IDENTIFY {}: word128={:#06x}, supported={}, enabled={}, locked={}, frozen={}, count_expired={}, bytes_returned={}",
+                path.display(),
+                word128,
+                supported,
+                enabled,
+                locked,
+                frozen,
+                count_expired,
+                bytes_returned
+            );
+
+            Some(if !supported {
+                AtaSecurityState::NotSupported
+            } else if count_expired {
+                AtaSecurityState::CountExpired
+            } else if frozen {
+                AtaSecurityState::Frozen
+            } else if locked {
+                AtaSecurityState::Locked
+            } else if enabled {
+                AtaSecurityState::Enabled
+            } else {
+                AtaSecurityState::Disabled
+            })
+        })();
+
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+
+        result
+    }
+
     /// Query device properties and build a DriveInfo.
     pub fn inspect_drive(path: &Path) -> Result<DriveInfo> {
         let path_str = path.to_string_lossy();
@@ -143,7 +275,7 @@ mod imp {
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(wide.as_ptr()),
-                0,
+                0x80000000u32.into(), // GENERIC_READ
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 OPEN_EXISTING,
@@ -167,9 +299,11 @@ mod imp {
         }
 
         let result = query_drive_info(handle, path);
+
         unsafe {
             let _ = CloseHandle(handle);
         }
+
         result
     }
 
@@ -235,7 +369,18 @@ mod imp {
                     None,
                 )
             };
-            if ok.is_ok() { length_info as u64 } else { 0 }
+
+            match ok {
+                Ok(_) => length_info as u64,
+                Err(ref e) => {
+                    log::debug!(
+                        "IOCTL_DISK_GET_LENGTH_INFO failed for {}: {}",
+                        path.display(),
+                        e
+                    );
+                    0
+                }
+            }
         };
 
         // Query sector size via IOCTL_DISK_GET_DRIVE_GEOMETRY_EX.
@@ -312,7 +457,7 @@ mod imp {
             transport,
             is_boot_drive,
             is_removable,
-            ata_security: AtaSecurityState::NotSupported,
+            ata_security: query_ata_security(path).unwrap_or(AtaSecurityState::NotSupported),
             hidden_areas: HiddenAreaInfo::default(),
             supports_trim: is_ssd || transport == Transport::Nvme,
             is_sed: false,
