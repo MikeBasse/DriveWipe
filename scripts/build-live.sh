@@ -88,10 +88,10 @@ COPY kernel/ /build/kernel/
 
 WORKDIR /build/kernel/drivewipe
 
-RUN make KDIR=/lib/modules/$(ls /lib/modules/ | head -1)/build 2>&1 || {
-    echo "Kernel module build failed (expected if headers mismatch)"
-    echo "Module will be skipped in the live image"
-    exit 0
+RUN make KDIR=/lib/modules/$(ls /lib/modules/ | head -1)/build 2>&1 || { \
+    echo "Kernel module build failed (expected if headers mismatch)"; \
+    echo "Module will be skipped in the live image"; \
+    exit 0; \
 }
 
 # Output: the .ko file if build succeeded
@@ -155,6 +155,19 @@ RUN apk add --no-cache \
     syslinux \
     grub-efi
 
+RUN mkdir -p /drivewipe-live
+
+# Populate the live rootfs with the Alpine userspace installed above.
+# Exclude pseudo-filesystems and /drivewipe-live itself to avoid recursive copy.
+RUN tar \
+    --exclude='./drivewipe-live' \
+    --exclude='./proc/*' \
+    --exclude='./sys/*' \
+    --exclude='./dev/*' \
+    --exclude='./tmp/*' \
+    --exclude='./run/*' \
+    -C / -cf - . \
+    | tar -C /drivewipe-live -xf -
 # Create directory structure
 RUN mkdir -p \
     /drivewipe-live/boot/syslinux \
@@ -287,7 +300,7 @@ echo ""
 # ── Done ─────────────────────────────────────────────────────────────────────
 
 echo "================================================================="
-echo "        🎉 DriveWipe Live v${DRIVEWIPE_LIVE_VERSION} Build Complete"
+echo "        🎉 DriveWipe Live v${DRIVEWIPE_LIVE_VERSION:-latest} Build Complete"
 echo "================================================================="
 echo ""
 echo "📦 OUTPUTS:"
